@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "name": "dcv-host",
+      "ssh_target": "dcv-host",
+      "dcv_list_command": "sudo -n dcv list-sessions"
+    }
+  ],
+  "ssh_timeout_seconds": 8,
+  "refresh_seconds": 15
+}

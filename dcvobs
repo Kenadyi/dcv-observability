@@ -1,0 +1,1043 @@
+#!/usr/bin/env bash
+# DCV Observability deployment launcher. Compatible with Bash 3.2+.
+
+set -u
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+VENV_DIR="$SCRIPT_DIR/.venv"
+REQUIREMENTS_FILE="$SCRIPT_DIR/requirements.txt"
+FINGERPRINT_FILE="$VENV_DIR/.dcvobs-requirements.sha256"
+RUNTIME_MANIFEST="$SCRIPT_DIR/runtime/runtime.conf"
+RUNTIME_DIST_DIR="$SCRIPT_DIR/runtime/dist"
+PRIVATE_RUNTIME_PARENT="$SCRIPT_DIR/.runtime"
+PRIVATE_RUNTIME="$PRIVATE_RUNTIME_PARENT/python"
+PRIVATE_PYTHON="$PRIVATE_RUNTIME/bin/python3.11"
+PRIVATE_OPENSSL_LIB="$PRIVATE_RUNTIME/openssl/lib64"
+RUNTIME_DIR="/var/run/dcv-observability"
+LOG_DIR="/var/log/dcv-observability"
+APP_LOG="$LOG_DIR/application.log"
+PID_FILE="$RUNTIME_DIR/application.pid"
+PORT_FILE="$RUNTIME_DIR/application.port"
+STARTED_FILE="$RUNTIME_DIR/application.started"
+STATE_FILE="$RUNTIME_DIR/application.state"
+BIND_HOST="0.0.0.0"
+PORT_MIN=8900
+PORT_MAX=8999
+DCV_LOG_DIR="/var/log/dcv"
+DCVOBS_STARTUP_TIMEOUT="${DCVOBS_STARTUP_TIMEOUT:-120}"
+
+RUNTIME_ID=""
+RUNTIME_VERSION=""
+RUNTIME_PYTHON_VERSION=""
+RUNTIME_OPENSSL_VERSION=""
+RUNTIME_ARCHITECTURE=""
+RUNTIME_GLIBC_BASELINE=""
+RUNTIME_ARTIFACT=""
+RUNTIME_SHA256_FILE=""
+RUNTIME_ARCHIVE_ROOT=""
+RUNTIME_DOWNLOAD_URL=""
+PRIVATE_ARTIFACT_PATH=""
+PRIVATE_SHA_STATUS="NOT VERIFIED"
+PRIVATE_PYTHON_VERSION="Unavailable"
+PRIVATE_OPENSSL_VERSION="Unavailable"
+PRIVATE_ARCHITECTURE="Unavailable"
+PRIVATE_ARTIFACT_SOURCE=""
+
+SELECTED_PYTHON=""
+PYTHON_VERSION="unknown"
+PYTHON_STATUS="REJECTED"
+PYTHON_REASON="unknown failure"
+DISCOVERED_PYTHONS=()
+
+usage() {
+    cat <<'EOF'
+DCV Observability launcher
+
+Usage:
+  sudo ./dcvobs start       Install the private runtime/venv if needed and start
+  sudo ./dcvobs stop        Gracefully stop the app
+  sudo ./dcvobs restart     Stop and start the app
+  sudo ./dcvobs status      Show process and HTTP health information
+  sudo ./dcvobs logs        Follow the launcher/application log
+  sudo ./dcvobs preflight   Validate the OS, DCV, and available Python runtimes
+  ./dcvobs --help           Show this help
+
+Start, stop, and restart require root because the application may need to read
+privileged DCV logs. The launcher does not modify system Python/OpenSSL, DCV,
+firewall rules, OS packages, or permissions under /var/log/dcv.
+EOF
+}
+
+error() {
+    printf 'ERROR: %s\n' "$*" >&2
+}
+
+require_root() {
+    if [ "${DCVOBS_TESTING:-0}" != "1" ] && [ "$(id -u)" -ne 0 ]; then
+        error "This command must be run as root (use sudo)."
+        return 1
+    fi
+}
+
+load_runtime_manifest() {
+    local line key value
+    [ -r "$RUNTIME_MANIFEST" ] || { error "Private runtime manifest is missing: $RUNTIME_MANIFEST"; return 1; }
+    RUNTIME_ID="" RUNTIME_VERSION="" RUNTIME_PYTHON_VERSION="" RUNTIME_OPENSSL_VERSION=""
+    RUNTIME_ARCHITECTURE="" RUNTIME_GLIBC_BASELINE="" RUNTIME_ARTIFACT=""
+    RUNTIME_SHA256_FILE="" RUNTIME_ARCHIVE_ROOT="" RUNTIME_DOWNLOAD_URL=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in *=*) ;; *) error "Invalid private runtime manifest line."; return 1 ;; esac
+        key=${line%%=*}
+        value=${line#*=}
+        case "$key" in
+            runtime_id|RUNTIME_ID) RUNTIME_ID="$value" ;;
+            runtime_version|RUNTIME_VERSION) RUNTIME_VERSION="$value" ;;
+            python_version|PYTHON_VERSION) RUNTIME_PYTHON_VERSION="$value" ;;
+            openssl_version|OPENSSL_VERSION) RUNTIME_OPENSSL_VERSION="$value" ;;
+            architecture|ARCHITECTURE) RUNTIME_ARCHITECTURE="$value" ;;
+            glibc_baseline|GLIBC_BASELINE) RUNTIME_GLIBC_BASELINE="$value" ;;
+            artifact|RUNTIME_ARTIFACT) RUNTIME_ARTIFACT="$value" ;;
+            sha256_file|SHA256_FILE) RUNTIME_SHA256_FILE="$value" ;;
+            archive_root|ARCHIVE_ROOT) RUNTIME_ARCHIVE_ROOT="$value" ;;
+            download_url|RUNTIME_URL) RUNTIME_DOWNLOAD_URL="$value" ;;
+        esac
+    done < "$RUNTIME_MANIFEST"
+    for value in "$RUNTIME_ID" "$RUNTIME_VERSION" "$RUNTIME_PYTHON_VERSION" "$RUNTIME_OPENSSL_VERSION" \
+        "$RUNTIME_ARCHITECTURE" "$RUNTIME_GLIBC_BASELINE" "$RUNTIME_ARTIFACT" \
+        "$RUNTIME_SHA256_FILE" "$RUNTIME_ARCHIVE_ROOT"; do
+        [ -n "$value" ] || { error "Private runtime manifest is incomplete."; return 1; }
+    done
+    case "$RUNTIME_ARTIFACT:$RUNTIME_SHA256_FILE:$RUNTIME_ARCHIVE_ROOT" in
+        */*|*..*) error "Private runtime manifest contains an unsafe filename."; return 1 ;;
+    esac
+    resolve_runtime_download_url || true
+}
+
+resolve_runtime_download_url() {
+    local git_command origin repository
+    if [ -n "${DCVOBS_RUNTIME_URL:-}" ]; then
+        RUNTIME_DOWNLOAD_URL="$DCVOBS_RUNTIME_URL"
+        return 0
+    fi
+    [ -z "$RUNTIME_DOWNLOAD_URL" ] || return 0
+    git_command=$(command -v git 2>/dev/null || true)
+    [ -n "$git_command" ] || return 1
+    origin=$("$git_command" -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)
+    case "$origin" in
+        https://github.com/*) repository=${origin#https://github.com/} ;;
+        git@github.com:*) repository=${origin#git@github.com:} ;;
+        ssh://git@github.com/*) repository=${origin#ssh://git@github.com/} ;;
+        *) return 1 ;;
+    esac
+    repository=${repository%.git}
+    case "$repository" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    RUNTIME_DOWNLOAD_URL="https://github.com/$repository/releases/download/$RUNTIME_VERSION/$RUNTIME_ARTIFACT"
+}
+
+runtime_expected_checksum() {
+    local checksum_file="$RUNTIME_DIST_DIR/$RUNTIME_SHA256_FILE" expected named
+    [ -r "$checksum_file" ] || { error "Private runtime checksum file is missing: $checksum_file"; return 1; }
+    expected=$(awk 'NF >= 2 {print $1; exit}' "$checksum_file")
+    named=$(awk 'NF >= 2 {print $2; exit}' "$checksum_file")
+    named=${named#\*}
+    if [ "${#expected}" -ne 64 ]; then
+        error "Private runtime checksum file is invalid."
+        return 1
+    fi
+    case "$expected" in *[!0-9a-fA-F]*) error "Private runtime checksum file is invalid."; return 1 ;; esac
+    [ "$named" = "$RUNTIME_ARTIFACT" ] || { error "Private runtime checksum filename does not match the manifest."; return 1; }
+    printf '%s\n' "$expected"
+}
+
+find_curl() {
+    command -v curl 2>/dev/null || true
+}
+
+find_wget() {
+    command -v wget 2>/dev/null || true
+}
+
+validate_github_token() {
+    case "${DCVOBS_GITHUB_TOKEN:-}" in
+        '' ) return 0 ;;
+        *[!A-Za-z0-9_.-]*) error "DCVOBS_GITHUB_TOKEN contains unsupported characters."; return 1 ;;
+    esac
+}
+
+download_with_curl() {
+    local url="$1" output="$2" curl_command auth_config="" result=0
+    curl_command=$(find_curl)
+    [ -n "$curl_command" ] || return 127
+    if [ -n "${DCVOBS_GITHUB_TOKEN:-}" ]; then
+        validate_github_token || return 1
+        auth_config=$(mktemp "${TMPDIR:-/tmp}/dcvobs-curl-auth.XXXXXX") || return 1
+        chmod 0600 "$auth_config"
+        printf 'header = "Authorization: Bearer %s"\n' "$DCVOBS_GITHUB_TOKEN" > "$auth_config"
+    fi
+    if [ -n "$auth_config" ]; then
+        "$curl_command" --config "$auth_config" --fail --location --proto '=https' --tlsv1.2 --silent --show-error --output "$output" "$url" || result=$?
+        rm -f -- "$auth_config"
+    else
+        "$curl_command" --fail --location --proto '=https' --tlsv1.2 --silent --show-error --output "$output" "$url" || result=$?
+    fi
+    return "$result"
+}
+
+download_with_wget() {
+    local url="$1" output="$2" wget_command auth_config="" result=0
+    wget_command=$(find_wget)
+    [ -n "$wget_command" ] || return 127
+    if [ -n "${DCVOBS_GITHUB_TOKEN:-}" ]; then
+        validate_github_token || return 1
+        auth_config=$(mktemp "${TMPDIR:-/tmp}/dcvobs-wget-auth.XXXXXX") || return 1
+        chmod 0600 "$auth_config"
+        printf 'header = Authorization: Bearer %s\n' "$DCVOBS_GITHUB_TOKEN" > "$auth_config"
+    fi
+    if [ -n "$auth_config" ]; then
+        "$wget_command" --config="$auth_config" --quiet --output-document="$output" "$url" || result=$?
+        rm -f -- "$auth_config"
+    else
+        "$wget_command" --quiet --output-document="$output" "$url" || result=$?
+    fi
+    return "$result"
+}
+
+download_runtime_artifact() {
+    local destination="$1" partial transfer_result=0
+    partial=$(mktemp "$destination.part.XXXXXX") || return 1
+    printf 'Downloading runtime artifact...\n'
+    if [ -n "$(find_curl)" ]; then
+        download_with_curl "$RUNTIME_DOWNLOAD_URL" "$partial" || transfer_result=$?
+    elif [ -n "$(find_wget)" ]; then
+        download_with_wget "$RUNTIME_DOWNLOAD_URL" "$partial" || transfer_result=$?
+    else
+        rm -f -- "$partial"
+        error "Neither curl nor wget is available to download the private runtime."
+        return 1
+    fi
+    if [ "$transfer_result" -ne 0 ]; then
+        rm -f -- "$partial"
+        error "Runtime asset could not be downloaded. Authentication may be required for the private GitHub repository."
+        return 1
+    fi
+    printf 'Runtime download completed.\n'
+    if ! verify_runtime_artifact "$partial"; then
+        rm -f -- "$partial" "$destination"
+        return 1
+    fi
+    mv "$partial" "$destination" || { rm -f -- "$partial"; return 1; }
+}
+
+acquire_runtime_artifact() {
+    local local_artifact cache_dir cached_artifact
+    local_artifact="$RUNTIME_DIST_DIR/$RUNTIME_ARTIFACT"
+    if [ -r "$local_artifact" ]; then
+        PRIVATE_ARTIFACT_PATH="$local_artifact"
+        PRIVATE_ARTIFACT_SOURCE="local"
+        return 0
+    fi
+    printf 'Local runtime artifact not found.\n'
+    if [ -z "$RUNTIME_DOWNLOAD_URL" ]; then
+        error "Private runtime artifact is missing and no download URL is configured."
+        return 1
+    fi
+    case "$RUNTIME_DOWNLOAD_URL" in
+        https://*) ;;
+        *) error "Private runtime download URL must use HTTPS."; return 1 ;;
+    esac
+    cache_dir="$PRIVATE_RUNTIME_PARENT/cache"
+    cached_artifact="$cache_dir/$RUNTIME_ARTIFACT"
+    mkdir -p "$cache_dir" || return 1
+    chmod 0750 "$PRIVATE_RUNTIME_PARENT" "$cache_dir"
+    if [ ! -r "$cached_artifact" ]; then
+        download_runtime_artifact "$cached_artifact" || return 1
+        PRIVATE_ARTIFACT_SOURCE="downloaded"
+    else
+        PRIVATE_ARTIFACT_SOURCE="download-cache"
+    fi
+    PRIVATE_ARTIFACT_PATH="$cached_artifact"
+}
+
+verify_runtime_artifact() {
+    local artifact="$1" expected check_file verify_ok=1
+    expected=$(runtime_expected_checksum) || return 1
+    check_file=$(mktemp "${TMPDIR:-/tmp}/dcvobs-runtime-checksum.XXXXXX") || return 1
+    printf '%s  %s\n' "$expected" "$artifact" > "$check_file"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$check_file" >/dev/null 2>&1 || verify_ok=0
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c "$check_file" >/dev/null 2>&1 || verify_ok=0
+    else
+        error "No SHA256 utility is available (sha256sum or shasum required)."
+        verify_ok=0
+    fi
+    rm -f -- "$check_file"
+    if [ "$verify_ok" -ne 1 ]; then
+        PRIVATE_SHA_STATUS="FAILED"
+        error "Private runtime checksum verification failed."
+        return 1
+    fi
+    PRIVATE_SHA_STATUS="VERIFIED"
+    printf 'SHA256 VERIFIED\n'
+}
+
+archive_paths_are_safe() {
+    local archive="$1" listing
+    listing=$(tar -tzf "$archive" 2>/dev/null) || { error "Private runtime archive could not be read."; return 1; }
+    printf '%s\n' "$listing" | awk -v root="$RUNTIME_ARCHIVE_ROOT" '
+        /^\// { exit 1 }
+        {
+            count = split($0, parts, "/")
+            if (parts[1] != root) exit 1
+            for (i = 1; i <= count; i++) {
+                if (parts[i] == "..") exit 1
+            }
+        }
+    ' || { error "Private runtime archive contains an unsafe path."; return 1; }
+}
+
+extract_runtime_artifact() {
+    local artifact="$1" extraction_root source entry target
+    archive_paths_are_safe "$artifact" || return 1
+    mkdir -p "$PRIVATE_RUNTIME_PARENT" || return 1
+    chmod 0750 "$PRIVATE_RUNTIME_PARENT"
+    extraction_root=$(mktemp -d "$PRIVATE_RUNTIME_PARENT/.extract.XXXXXX") || return 1
+    if ! tar --no-same-owner -xzf "$artifact" -C "$extraction_root"; then
+        rm -rf -- "$extraction_root"
+        error "Private runtime extraction failed."
+        return 1
+    fi
+    source="$extraction_root/$RUNTIME_ARCHIVE_ROOT"
+    if [ ! -d "$source" ] || [ ! -x "$source/bin/python3.11" ]; then
+        rm -rf -- "$extraction_root"
+        error "Private runtime archive layout is invalid."
+        return 1
+    fi
+    while IFS= read -r entry; do
+        target=$(readlink "$entry" 2>/dev/null || true)
+        case "$target" in /*|..|../*|*/../*|*/..) rm -rf -- "$extraction_root"; error "Private runtime archive contains an unsafe symbolic link."; return 1 ;; esac
+    done < <(find "$source" -type l -print)
+    if [ -e "$PRIVATE_RUNTIME" ]; then
+        rm -rf -- "$PRIVATE_RUNTIME"
+    fi
+    mv "$source" "$PRIVATE_RUNTIME" || { rm -rf -- "$extraction_root"; return 1; }
+    rm -rf -- "$extraction_root"
+}
+
+private_library_path() {
+    printf '%s' "$PRIVATE_OPENSSL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+}
+
+host_architecture() {
+    uname -m 2>/dev/null || printf 'Unknown'
+}
+
+run_with_private_libs() {
+    env -u DCVOBS_GITHUB_TOKEN LD_LIBRARY_PATH="$(private_library_path)" "$@"
+}
+
+run_private_python() {
+    run_with_private_libs "$PRIVATE_PYTHON" "$@"
+}
+
+run_venv_python() {
+    run_with_private_libs "$VENV_DIR/bin/python" "$@"
+}
+
+validate_private_runtime() {
+    local details temp_root temp_venv expected_marker expected_checksum
+    PRIVATE_PYTHON_VERSION="Unavailable"
+    PRIVATE_OPENSSL_VERSION="Unavailable"
+    PRIVATE_ARCHITECTURE="Unavailable"
+    [ "$(host_architecture)" = "$RUNTIME_ARCHITECTURE" ] || { error "Private runtime requires architecture $RUNTIME_ARCHITECTURE."; return 1; }
+    [ -x "$PRIVATE_PYTHON" ] || { error "Private runtime Python is missing: $PRIVATE_PYTHON"; return 1; }
+    [ -r "$PRIVATE_OPENSSL_LIB/libssl.so.3" ] && [ -r "$PRIVATE_OPENSSL_LIB/libcrypto.so.3" ] || { error "Private runtime OpenSSL libraries are missing."; return 1; }
+    details=$(run_private_python -c 'import hashlib, platform, ssl, sys, venv; print(".".join(map(str, sys.version_info[:3]))); print(ssl.OPENSSL_VERSION); print(platform.machine())' 2>/dev/null) || { error "Private runtime Python/SSL/venv validation failed."; return 1; }
+    PRIVATE_PYTHON_VERSION=$(printf '%s\n' "$details" | sed -n '1p')
+    PRIVATE_OPENSSL_VERSION=$(printf '%s\n' "$details" | sed -n '2p')
+    PRIVATE_ARCHITECTURE=$(printf '%s\n' "$details" | sed -n '3p')
+    [ "$PRIVATE_PYTHON_VERSION" = "$RUNTIME_PYTHON_VERSION" ] || { error "Private runtime Python version is $PRIVATE_PYTHON_VERSION; expected $RUNTIME_PYTHON_VERSION."; return 1; }
+    case "$PRIVATE_OPENSSL_VERSION" in *"OpenSSL $RUNTIME_OPENSSL_VERSION"*) ;; *) error "Private runtime OpenSSL version is unexpected: $PRIVATE_OPENSSL_VERSION"; return 1 ;; esac
+    [ "$PRIVATE_ARCHITECTURE" = "$RUNTIME_ARCHITECTURE" ] || { error "Private runtime reports architecture $PRIVATE_ARCHITECTURE; expected $RUNTIME_ARCHITECTURE."; return 1; }
+
+    temp_root=$(mktemp -d "${TMPDIR:-/tmp}/dcvobs-private-venv-test.XXXXXX" 2>/dev/null || true)
+    [ -n "$temp_root" ] && [ -d "$temp_root" ] || { error "Unable to create a private runtime venv test directory."; return 1; }
+    temp_venv="$temp_root/venv"
+    if ! run_private_python -m venv "$temp_venv" >/dev/null 2>&1 || \
+       ! run_with_private_libs "$temp_venv/bin/python" -c 'import pip, ssl' >/dev/null 2>&1; then
+        rm -rf -- "$temp_root"
+        error "Private runtime temporary venv/pip validation failed."
+        return 1
+    fi
+    rm -rf -- "$temp_root"
+    return 0
+}
+
+installed_runtime_matches() {
+    local expected
+    [ -r "$PRIVATE_RUNTIME/.dcvobs-runtime-id" ] && [ -r "$PRIVATE_RUNTIME/.dcvobs-artifact.sha256" ] || return 1
+    [ "$(sed -n '1p' "$PRIVATE_RUNTIME/.dcvobs-runtime-id")" = "$RUNTIME_ID" ] || return 1
+    expected=$(runtime_expected_checksum) || return 1
+    [ "$(sed -n '1p' "$PRIVATE_RUNTIME/.dcvobs-artifact.sha256")" = "$expected" ]
+}
+
+ensure_private_runtime() {
+    local expected
+    PRIVATE_ARTIFACT_PATH=""
+    PRIVATE_SHA_STATUS="NOT VERIFIED"
+    PRIVATE_PYTHON_VERSION="Unavailable"
+    PRIVATE_OPENSSL_VERSION="Unavailable"
+    PRIVATE_ARCHITECTURE="Unavailable"
+    PRIVATE_ARTIFACT_SOURCE=""
+    load_runtime_manifest || return 1
+    [ "$(host_architecture)" = "$RUNTIME_ARCHITECTURE" ] || { error "Private runtime requires architecture $RUNTIME_ARCHITECTURE; this host is $(host_architecture)."; return 1; }
+    if installed_runtime_matches && validate_private_runtime; then
+        PRIVATE_ARTIFACT_PATH="$RUNTIME_ARTIFACT (installed runtime reused)"
+        PRIVATE_ARTIFACT_SOURCE="installed"
+        PRIVATE_SHA_STATUS="VERIFIED"
+        printf 'Private runtime HEALTHY\n'
+        return 0
+    fi
+    if [ -d "$PRIVATE_RUNTIME" ]; then
+        printf 'Installed private runtime is unhealthy; reinstalling.\n'
+    else
+        printf 'Private runtime not installed.\n'
+    fi
+    acquire_runtime_artifact || return 1
+    if [ "$PRIVATE_SHA_STATUS" != "VERIFIED" ] && ! verify_runtime_artifact "$PRIVATE_ARTIFACT_PATH"; then
+        if [ "$PRIVATE_ARTIFACT_SOURCE" = "download-cache" ]; then
+            rm -f -- "$PRIVATE_ARTIFACT_PATH"
+            PRIVATE_SHA_STATUS="NOT VERIFIED"
+            download_runtime_artifact "$PRIVATE_ARTIFACT_PATH" || return 1
+            PRIVATE_ARTIFACT_SOURCE="downloaded"
+        else
+            case "$PRIVATE_ARTIFACT_SOURCE" in downloaded) rm -f -- "$PRIVATE_ARTIFACT_PATH" ;; esac
+            return 1
+        fi
+    fi
+    printf 'Installing private runtime...\n'
+    extract_runtime_artifact "$PRIVATE_ARTIFACT_PATH" || return 1
+    validate_private_runtime || return 1
+    expected=$(runtime_expected_checksum) || return 1
+    printf '%s\n' "$RUNTIME_ID" > "$PRIVATE_RUNTIME/.dcvobs-runtime-id"
+    printf '%s\n' "$expected" > "$PRIVATE_RUNTIME/.dcvobs-artifact.sha256"
+    printf 'Private runtime HEALTHY\n'
+}
+
+is_conda_path() {
+    local candidate="$1" lowered resolved
+    resolved=$(realpath "$candidate" 2>/dev/null || readlink -f "$candidate" 2>/dev/null || true)
+    [ -n "$resolved" ] && candidate="$resolved"
+    lowered=$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')
+    case "$lowered" in
+        *miniconda*|*anaconda*|*/conda/*|*/conda) return 0 ;;
+    esac
+    return 1
+}
+
+add_python_candidate() {
+    local candidate="$1" existing
+    [ -n "$candidate" ] || return 0
+    for existing in ${DISCOVERED_PYTHONS[@]+"${DISCOVERED_PYTHONS[@]}"}; do
+        [ "$existing" = "$candidate" ] && return 0
+    done
+    DISCOVERED_PYTHONS+=("$candidate")
+}
+
+discover_python_candidates() {
+    local directory name resolved
+    DISCOVERED_PYTHONS=()
+
+    # Explicit locations are intentionally checked before PATH. No Conda
+    # installation directories are searched or accepted.
+    for name in python3.12 python3.11 python3.10 python3.9 python3; do
+        for directory in /usr/local/bin /usr/bin /opt/python/bin; do
+            [ -x "$directory/$name" ] && add_python_candidate "$directory/$name"
+        done
+        resolved=$(command -v "$name" 2>/dev/null || true)
+        [ -x "$resolved" ] && add_python_candidate "$resolved"
+    done
+}
+
+validate_python() {
+    local candidate="$1" temp_root temp_venv
+    PYTHON_VERSION="unknown"
+    PYTHON_STATUS="REJECTED"
+    PYTHON_REASON="unable to execute Python"
+
+    if is_conda_path "$candidate"; then
+        PYTHON_REASON="Conda Python paths are not allowed"
+        return 1
+    fi
+    if [ ! -x "$candidate" ]; then
+        PYTHON_REASON="not an executable file"
+        return 1
+    fi
+
+    PYTHON_VERSION=$("$candidate" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || true)
+    [ -n "$PYTHON_VERSION" ] || PYTHON_VERSION="unknown"
+
+    if ! "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+        PYTHON_REASON="Python < 3.9"
+        return 1
+    fi
+    if ! "$candidate" -c 'import ssl; assert ssl.OPENSSL_VERSION' >/dev/null 2>&1; then
+        PYTHON_REASON="Python SSL support unavailable (_ssl)"
+        return 1
+    fi
+    if ! "$candidate" -c 'import venv' >/dev/null 2>&1; then
+        PYTHON_REASON="Python venv support unavailable"
+        return 1
+    fi
+
+    temp_root=$(mktemp -d "${TMPDIR:-/tmp}/dcvobs-venv-test.XXXXXX" 2>/dev/null || true)
+    if [ -z "$temp_root" ] || [ ! -d "$temp_root" ]; then
+        PYTHON_REASON="unable to create temporary directory for venv test"
+        return 1
+    fi
+    temp_venv="$temp_root/venv"
+    if ! "$candidate" -m venv "$temp_venv" >/dev/null 2>&1; then
+        rm -rf -- "$temp_root"
+        PYTHON_REASON="temporary venv creation failed"
+        return 1
+    fi
+    if [ ! -x "$temp_venv/bin/python" ] || ! "$temp_venv/bin/python" -c 'import sys' >/dev/null 2>&1; then
+        rm -rf -- "$temp_root"
+        PYTHON_REASON="temporary venv Python could not start"
+        return 1
+    fi
+    if [ -e "$temp_venv/bin/pip" ] && ! "$temp_venv/bin/pip" --version >/dev/null 2>&1; then
+        rm -rf -- "$temp_root"
+        PYTHON_REASON="temporary venv pip could not start"
+        return 1
+    fi
+    rm -rf -- "$temp_root"
+
+    PYTHON_STATUS="HEALTHY"
+    PYTHON_REASON="Python 3.9+, SSL, and venv checks passed"
+    return 0
+}
+
+select_python() {
+    local candidate
+    SELECTED_PYTHON=""
+    discover_python_candidates
+    for candidate in ${DISCOVERED_PYTHONS[@]+"${DISCOVERED_PYTHONS[@]}"}; do
+        if validate_python "$candidate" && [ -z "$SELECTED_PYTHON" ]; then
+            SELECTED_PYTHON="$candidate"
+        fi
+    done
+    [ -n "$SELECTED_PYTHON" ]
+}
+
+print_python_candidates() {
+    local candidate
+    SELECTED_PYTHON=""
+    discover_python_candidates
+    if [ -z "${DISCOVERED_PYTHONS[*]-}" ]; then
+        printf '  (none found)\n'
+        return 1
+    fi
+    for candidate in ${DISCOVERED_PYTHONS[@]+"${DISCOVERED_PYTHONS[@]}"}; do
+        if validate_python "$candidate"; then
+            [ -z "$SELECTED_PYTHON" ] && SELECTED_PYTHON="$candidate"
+        fi
+        printf '  %s\n' "$candidate"
+        printf '    version: %s\n' "$PYTHON_VERSION"
+        printf '    status: %s\n' "$PYTHON_STATUS"
+        printf '    reason: %s\n' "$PYTHON_REASON"
+    done
+    [ -n "$SELECTED_PYTHON" ]
+}
+
+read_os_release() {
+    OS_NAME="Unknown"
+    OS_VERSION="Unknown"
+    OS_ID="unknown"
+    OS_VERSION_ID="unknown"
+    if [ -r /etc/os-release ]; then
+        # /etc/os-release is the OS vendor's shell-compatible metadata file.
+        ID="" VERSION_ID="" PRETTY_NAME="" VERSION="" NAME=""
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_ID="${ID:-unknown}"
+        OS_VERSION_ID="${VERSION_ID:-unknown}"
+        OS_NAME="${PRETTY_NAME:-${NAME:-Unknown}}"
+        OS_VERSION="${VERSION:-${VERSION_ID:-Unknown}}"
+    fi
+}
+
+os_support_status() {
+    case "$OS_ID:$OS_VERSION_ID" in
+        centos:7|rocky:8*|rocky:9*|amzn:2|amzn:2023) printf 'TARGET - validation required' ;;
+        *) printf 'UNVALIDATED' ;;
+    esac
+}
+
+parse_dcv_version_output() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") next
+            if (first == "") first = line
+            if (line ~ /(NICE DCV|Amazon DCV)/) {
+                print line
+                preferred = 1
+                exit
+            }
+        }
+        END { if (!preferred && first != "") print first }
+    '
+}
+
+dcv_version() {
+    local command_path="$1" output parsed
+    [ -n "$command_path" ] || { printf 'Unable to determine'; return; }
+
+    output=$("$command_path" version 2>/dev/null || true)
+    parsed=$(printf '%s\n' "$output" | parse_dcv_version_output)
+    if [ -n "$parsed" ]; then
+        printf '%s' "$parsed"
+        return 0
+    fi
+
+    output=$("$command_path" --version 2>/dev/null || true)
+    parsed=$(printf '%s\n' "$output" | parse_dcv_version_output)
+    if [ -n "$parsed" ]; then
+        printf '%s' "$parsed"
+        return 0
+    fi
+    printf 'Unable to determine'
+}
+
+find_dcv_command() {
+    command -v dcv 2>/dev/null || true
+}
+
+preflight() {
+    local dcv_command log_count persisted_port private_ok=0 runtime_healthy=0
+    local installed_status="not present" local_status="not present" download_required="yes"
+    local cached_artifact
+    read_os_release
+    dcv_command=$(find_dcv_command)
+    persisted_port="Not selected"
+    [ -r "$PORT_FILE" ] && persisted_port=$(sed -n '1p' "$PORT_FILE")
+
+    printf '%s\n\n' 'DCV Observability Preflight'
+    printf 'OS: %s\n' "$OS_NAME"
+    printf 'OS Version: %s\n' "$OS_VERSION"
+    printf 'OS support: %s\n' "$(os_support_status)"
+    printf 'Architecture: %s\n' "$(host_architecture)"
+    printf 'Hostname: %s\n' "$(hostname 2>/dev/null || printf 'Unknown')"
+    printf 'DCV command: %s\n' "${dcv_command:-NOT FOUND}"
+    printf 'DCV version: %s\n' "$(dcv_version "$dcv_command")"
+    if [ -d "$DCV_LOG_DIR" ]; then
+        log_count=$(find "$DCV_LOG_DIR" -maxdepth 2 -type f \( -name '*.log' -o -name 'server.log*' \) 2>/dev/null | wc -l | tr -d ' ')
+        printf 'DCV log directory: %s (present; %s expected log file(s) found)\n' "$DCV_LOG_DIR" "$log_count"
+    else
+        printf 'DCV log directory: %s (NOT FOUND)\n' "$DCV_LOG_DIR"
+    fi
+    printf '\nPrivate runtime:\n'
+    PRIVATE_SHA_STATUS="NOT VERIFIED"
+    if load_runtime_manifest && [ "$(host_architecture)" = "$RUNTIME_ARCHITECTURE" ] && runtime_expected_checksum >/dev/null; then
+        cached_artifact="$PRIVATE_RUNTIME_PARENT/cache/$RUNTIME_ARTIFACT"
+        [ -d "$PRIVATE_RUNTIME" ] && installed_status="present"
+        [ -r "$RUNTIME_DIST_DIR/$RUNTIME_ARTIFACT" ] && local_status="present"
+        if installed_runtime_matches && validate_private_runtime; then
+            runtime_healthy=1
+            private_ok=1
+            download_required="no"
+            PRIVATE_SHA_STATUS="VERIFIED"
+        elif [ "$local_status" = "present" ] || [ -r "$cached_artifact" ]; then
+            private_ok=1
+            download_required="no"
+        elif [ -n "$RUNTIME_DOWNLOAD_URL" ] && { [ -n "$(find_curl)" ] || [ -n "$(find_wget)" ]; }; then
+            private_ok=1
+        fi
+    fi
+    printf '  Artifact: %s\n' "${RUNTIME_ARTIFACT:-Unavailable}"
+    printf '  Installed runtime: %s\n' "$installed_status"
+    printf '  Local artifact: %s\n' "$local_status"
+    if [ -n "$RUNTIME_DOWNLOAD_URL" ]; then
+        printf '  Download source: GitHub Release %s\n' "${RUNTIME_VERSION:-Unavailable}"
+    else
+        printf '%s\n' '  Download source: not configured'
+    fi
+    printf '  Download required: %s\n' "$download_required"
+    printf '  SHA256: %s\n' "$PRIVATE_SHA_STATUS"
+    if [ "$runtime_healthy" -eq 1 ]; then
+        printf '  Python: %s\n' "$PRIVATE_PYTHON_VERSION"
+        printf '  OpenSSL: %s\n' "${RUNTIME_OPENSSL_VERSION:-Unavailable}"
+        printf '  Architecture: %s\n' "$PRIVATE_ARCHITECTURE"
+        printf '%s\n' '  SSL: OK' '  venv: OK' '  Status: HEALTHY'
+    else
+        printf '  Status: %s\n' "$([ "$installed_status" = "present" ] && printf 'UNHEALTHY - reinstall required' || printf 'NOT INSTALLED')"
+    fi
+    printf '\nSelected Python: %s\n' "$([ "$runtime_healthy" -eq 1 ] && printf 'Tuple private runtime' || { [ "$private_ok" -eq 1 ] && printf 'Tuple private runtime (installation required)' || printf 'NONE'; })"
+    printf 'Host Python candidates (diagnostic only):\n'
+    print_python_candidates || true
+    printf 'Application port: %s (preferred: %s)\n' "$persisted_port" "$PORT_MIN"
+
+    if [ -z "$dcv_command" ]; then
+        printf '\nWARNING: The dcv command was not found. DCV was not modified.\n'
+    fi
+    if [ ! -d "$DCV_LOG_DIR" ]; then
+        printf 'WARNING: %s does not exist. No permissions were changed.\n' "$DCV_LOG_DIR"
+    fi
+    if [ "$private_ok" -ne 1 ]; then
+        printf '\nPreflight: FAIL\n' >&2
+        return 1
+    fi
+    printf '\nPreflight: PASS\n'
+    return 0
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        error "No SHA256 utility is available (sha256sum or shasum required)."
+        return 1
+    fi
+}
+
+requirements_changed() {
+    local current recorded=""
+    current=$(sha256_file "$REQUIREMENTS_FILE") || return 0
+    [ -r "$FINGERPRINT_FILE" ] && recorded=$(sed -n '1p' "$FINGERPRINT_FILE")
+    [ "$current" != "$recorded" ]
+}
+
+ensure_runtime() {
+    local fingerprint
+    [ -r "$REQUIREMENTS_FILE" ] || { error "requirements.txt is missing."; return 1; }
+    fingerprint=$(sha256_file "$REQUIREMENTS_FILE") || return 1
+    ensure_private_runtime || return 1
+
+    if [ -d "$VENV_DIR" ] && { [ ! -r "$VENV_DIR/.dcvobs-runtime-id" ] || [ "$(sed -n '1p' "$VENV_DIR/.dcvobs-runtime-id")" != "$RUNTIME_ID" ]; }; then
+        printf 'Rebuilding the application virtual environment for the Tuple private runtime...\n'
+        rm -rf -- "$VENV_DIR"
+    fi
+    if [ ! -d "$VENV_DIR" ]; then
+        printf 'Creating application virtual environment with the Tuple private runtime...\n'
+        run_private_python -m venv "$VENV_DIR" || { error "Virtual environment creation failed."; return 1; }
+        printf '%s\n' "$RUNTIME_ID" > "$VENV_DIR/.dcvobs-runtime-id"
+    fi
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        error "$VENV_DIR exists but does not contain an executable Python."
+        return 1
+    fi
+    if ! run_venv_python -c 'import pip, ssl, sys; assert sys.version_info[:2] == (3, 11)' >/dev/null 2>&1; then
+        error "The application virtual environment is not healthy."
+        return 1
+    fi
+
+    if requirements_changed; then
+        printf 'Installing application dependencies...\n'
+        run_venv_python -m pip install -r "$REQUIREMENTS_FILE" || { error "Dependency installation failed."; return 1; }
+        printf '%s\n' "$fingerprint" > "$FINGERPRINT_FILE"
+    else
+        printf 'Application dependencies are unchanged.\n'
+    fi
+}
+
+port_is_available() {
+    local python="$1" port="$2"
+    run_with_private_libs "$python" - "$BIND_HOST" "$port" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+finally:
+    sock.close()
+PY
+}
+
+select_port() {
+    local python="$1" port
+    port=$PORT_MIN
+    while [ "$port" -le "$PORT_MAX" ]; do
+        if port_is_available "$python" "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+        printf 'Port %s is already in use.\n' "$port" >&2
+        port=$((port + 1))
+    done
+    error "No available application port was found in $PORT_MIN-$PORT_MAX."
+    return 1
+}
+
+read_pid() {
+    [ -r "$PID_FILE" ] || return 1
+    sed -n '1p' "$PID_FILE"
+}
+
+process_identity_matches() {
+    local pid="$1" command_line process_cwd
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        command_line=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        process_cwd=$(cd "/proc/$pid/cwd" 2>/dev/null && pwd -P || true)
+        [ "$process_cwd" = "$SCRIPT_DIR" ] || return 1
+    else
+        command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    fi
+    case "$command_line" in
+        *uvicorn*app.main:app*) return 0 ;;
+    esac
+    return 1
+}
+
+clear_runtime_state() {
+    rm -f -- "$PID_FILE" "$PORT_FILE" "$STARTED_FILE" "$STATE_FILE"
+}
+
+running_pid() {
+    local pid
+    pid=$(read_pid 2>/dev/null || true)
+    if [ -n "$pid" ] && process_identity_matches "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    if [ -n "$pid" ]; then
+        printf 'Removing stale PID state for PID %s.\n' "$pid" >&2
+        clear_runtime_state
+    fi
+    return 1
+}
+
+http_health() {
+    local port="$1" python="$2"
+    run_with_private_libs "$python" - "$port" <<'PY' >/dev/null 2>&1
+import sys
+from urllib.request import urlopen
+
+with urlopen("http://127.0.0.1:%s/api/status" % sys.argv[1], timeout=2) as response:
+    raise SystemExit(0 if 200 <= response.status < 300 else 1)
+PY
+}
+
+validate_startup_timeout() {
+    case "$DCVOBS_STARTUP_TIMEOUT" in
+        ''|*[!0-9]*) error "DCVOBS_STARTUP_TIMEOUT must be a positive integer."; return 1 ;;
+    esac
+    if [ -z "$(printf '%s' "$DCVOBS_STARTUP_TIMEOUT" | sed 's/^0*//')" ]; then
+        error "DCVOBS_STARTUP_TIMEOUT must be a positive integer."
+        return 1
+    fi
+}
+
+startup_process_alive() {
+    kill -0 "$1" 2>/dev/null
+}
+
+startup_sleep() {
+    sleep "$1"
+}
+
+wait_for_startup_health() {
+    local pid="$1" port="$2" timeout="$3"
+    STARTUP_ELAPSED=0
+    STARTUP_RESULT="TIMEOUT"
+    while :; do
+        if ! startup_process_alive "$pid"; then
+            STARTUP_RESULT="EXITED"
+            return 1
+        fi
+        if http_health "$port" "$VENV_DIR/bin/python"; then
+            STARTUP_RESULT="HEALTHY"
+            return 0
+        fi
+        if [ "$STARTUP_ELAPSED" -ge "$timeout" ]; then
+            STARTUP_RESULT="TIMEOUT"
+            return 1
+        fi
+        startup_sleep 1
+        STARTUP_ELAPSED=$((STARTUP_ELAPSED + 1))
+        if [ $((STARTUP_ELAPSED % 10)) -eq 0 ]; then
+            printf 'Waiting for application startup... %ss\n' "$STARTUP_ELAPSED"
+        fi
+    done
+}
+
+show_recent_application_log() {
+    printf '%s\n' "Recent application log output ($APP_LOG):" >&2
+    tail -n 40 "$APP_LOG" >&2 2>/dev/null || true
+}
+
+terminate_failed_startup() {
+    local pid="$1" waited=0
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+}
+
+prepare_state_directories() {
+    umask 027
+    mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
+    chmod 0750 "$RUNTIME_DIR" "$LOG_DIR"
+    touch "$APP_LOG"
+    chmod 0640 "$APP_LOG"
+}
+
+start_app() {
+    local pid port url startup_timestamp
+    require_root || return 1
+    validate_startup_timeout || return 1
+    pid=$(running_pid 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        port=$(sed -n '1p' "$PORT_FILE" 2>/dev/null || printf 'unknown')
+        printf '%s\n' 'DCV Observability is already running' "PID: $pid" "Port: $port"
+        return 0
+    fi
+    preflight || return 1
+    ensure_runtime || return 1
+    prepare_state_directories || { error "Unable to create protected runtime/log directories."; return 1; }
+    port=$(select_port "$VENV_DIR/bin/python") || return 1
+    printf 'Selected port: %s\n' "$port"
+    startup_timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    {
+        printf '%s\n' '========================================' 'DCV Observability startup' "$startup_timestamp" '========================================'
+    } >> "$APP_LOG"
+
+    (
+        cd "$SCRIPT_DIR" || exit 1
+        env -u DCVOBS_GITHUB_TOKEN LD_LIBRARY_PATH="$(private_library_path)" nohup "$VENV_DIR/bin/python" -m uvicorn app.main:app --host "$BIND_HOST" --port "$port" >> "$APP_LOG" 2>&1 &
+        printf '%s\n' "$!" > "$PID_FILE"
+    )
+    pid=$(read_pid) || { error "Application PID was not recorded."; return 1; }
+    printf '%s\n' "$port" > "$PORT_FILE"
+    printf '%s\n' "$startup_timestamp" > "$STARTED_FILE"
+    printf 'STARTING\n' > "$STATE_FILE"
+
+    if wait_for_startup_health "$pid" "$port" "$DCVOBS_STARTUP_TIMEOUT"; then
+        printf 'RUNNING\n' > "$STATE_FILE"
+        url="http://$(hostname 2>/dev/null || printf '127.0.0.1'):$port"
+        printf '%s\n' 'DCV Observability started.' "PID: $pid" "Port: $port" "URL: $url" 'HTTP: HEALTHY' "Startup time: ${STARTUP_ELAPSED}s" "Log file: $APP_LOG"
+        return 0
+    fi
+
+    if [ "$STARTUP_RESULT" = "EXITED" ]; then
+        error "Application process exited during startup."
+        printf '%s\n' "PID: $pid" "Port: $port" "Elapsed time: ${STARTUP_ELAPSED}s" >&2
+        clear_runtime_state
+        show_recent_application_log
+        return 1
+    fi
+
+    error "Application process is still running, but /api/status did not become healthy within $DCVOBS_STARTUP_TIMEOUT seconds."
+    printf '%s\n' "PID: $pid" "Port: $port" "Elapsed time: ${STARTUP_ELAPSED}s" >&2
+    show_recent_application_log
+    terminate_failed_startup "$pid"
+    clear_runtime_state
+    return 1
+}
+
+stop_app() {
+    local pid attempt
+    require_root || return 1
+    pid=$(running_pid 2>/dev/null || true)
+    if [ -z "$pid" ]; then
+        clear_runtime_state
+        printf 'DCV Observability is stopped.\n'
+        return 0
+    fi
+    printf 'Stopping DCV Observability (PID %s)...\n' "$pid"
+    kill -TERM "$pid" || { error "Unable to signal PID $pid."; return 1; }
+    attempt=0
+    while [ "$attempt" -lt 15 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            clear_runtime_state
+            printf 'DCV Observability stopped.\n'
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    error "PID $pid did not stop after 15 seconds; it was not force-killed."
+    return 1
+}
+
+status_app() {
+    local pid port started recorded_state version openssl health="UNAVAILABLE" process="not running" url="Unavailable" python="$VENV_DIR/bin/python" source="Unavailable" details
+    pid=$(running_pid 2>/dev/null || true)
+    port=$(sed -n '1p' "$PORT_FILE" 2>/dev/null || printf 'Unavailable')
+    started=$(sed -n '1p' "$STARTED_FILE" 2>/dev/null || printf 'Unavailable')
+    recorded_state=$(sed -n '1p' "$STATE_FILE" 2>/dev/null || printf 'RUNNING')
+    load_runtime_manifest >/dev/null 2>&1 || true
+    if [ -x "$python" ] && [ -r "$VENV_DIR/.dcvobs-runtime-id" ] && [ "$(sed -n '1p' "$VENV_DIR/.dcvobs-runtime-id")" = "$RUNTIME_ID" ]; then
+        details=$(run_with_private_libs "$python" -c 'import ssl, sys; print(".".join(map(str, sys.version_info[:3]))); print(ssl.OPENSSL_VERSION)' 2>/dev/null || true)
+        version=$(printf '%s\n' "$details" | sed -n '1p')
+        openssl=$(printf '%s\n' "$details" | sed -n '2p')
+        [ -n "$version" ] || version="Unavailable"
+        [ -n "$openssl" ] || openssl="Unavailable"
+        source="Tuple private runtime"
+    else
+        python="Unavailable"
+        version="Unavailable"
+        openssl="Unavailable"
+    fi
+    if [ -n "$pid" ]; then
+        process="running"
+        url="http://$(hostname 2>/dev/null || printf '127.0.0.1'):$port"
+        if [ "$recorded_state" = "STARTING" ]; then
+            health="WAITING"
+            printf 'DCV Observability: STARTING\n'
+        else
+            if [ "$python" != "Unavailable" ] && http_health "$port" "$python"; then health="HEALTHY"; else health="UNHEALTHY"; fi
+            printf 'DCV Observability: RUNNING\n'
+        fi
+    else
+        pid="Unavailable"
+        printf 'DCV Observability: STOPPED\n'
+    fi
+    printf '%s\n' "PID: $pid" "Port: $port" "URL: $url" "Process status: $process" "HTTP: $health" "Python source: $source" "Python executable: $python" "Python version: $version" "OpenSSL version: $openssl" "Startup time: $started"
+}
+
+logs_app() {
+    if [ ! -r "$APP_LOG" ]; then
+        error "Application log does not exist yet: $APP_LOG"
+        return 1
+    fi
+    tail -n 100 -f "$APP_LOG"
+}
+
+main() {
+    local command="${1:---help}"
+    case "$command" in
+        start) start_app ;;
+        stop) stop_app ;;
+        restart) require_root && stop_app && start_app ;;
+        status) status_app ;;
+        logs) logs_app ;;
+        preflight) preflight ;;
+        -h|--help|help) usage ;;
+        *) error "Unknown command: $command"; usage >&2; return 2 ;;
+    esac
+}
+
+if [ "${DCVOBS_TESTING:-0}" != "1" ]; then
+    main "$@"
+fi
